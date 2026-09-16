@@ -1,0 +1,18 @@
+# Compiled programs and object files
+/client
+/server
+*.o
+
+# Received files
+/downloads/
+
+# Python test caches
+__pycache__/
+*.py[cod]
+
+# Editor and operating system files
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
