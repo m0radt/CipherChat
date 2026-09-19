@@ -1,6 +1,6 @@
 #ifndef CLIENT_FILES_H
 #define CLIENT_FILES_H
-
+#include "network.h"
 #include <stddef.h>
 #include <sys/types.h>
 
@@ -8,7 +8,7 @@
 #define DOWNLOAD_PATH_LIMIT 4096
 #define MAX_INCOMING_FILES 16
 
-ssize_t send_file(int socket_fd, const char *recipient, const char *path);
+ssize_t send_file(Connection *connection, const char *recipient, const char *path);
 
 /* frame contains the complete decoded frame: [type][payload]. */
 int handle_incoming_file_frame(

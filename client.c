@@ -13,38 +13,43 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <signal.h>
 
 static bool connected = true;
-static int active_client_fd = -1;
+static Connection *active_connection = NULL;
 static int client_exit_code = 0;
 
 static void display_message(const unsigned char *message, size_t length);
 static void handle_input(char *line);
 static void handle_server_frame(const unsigned char *frame, size_t frame_length);
 static bool is_connection_error(int error_number);
-static int get_username_and_register_in_server(int client_fd);
-static int receive_welcome_message(int client_fd);
-static int handle_file_command(int client_fd, char *line);
+static int get_username_and_register_in_server(Connection *connection);
+static int receive_welcome_message(Connection *connection);
+static int handle_file_command(Connection *connection, char *line);
 
 int main(void) {
-    int client_fd = connect_to_server(SERVER_IP, SERVER_PORT);
-    if (client_fd == -1) {
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        perror("ignore SIGPIPE");
+        return 1;
+    }
+    Connection connection;
+    if (connect_to_server(SERVER_IP, SERVER_PORT, &connection) == -1) {
         return 1;
     }
 
-    if (get_username_and_register_in_server(client_fd) == -1 ||
-        receive_welcome_message(client_fd) == -1) {
-        close(client_fd);
+    if (get_username_and_register_in_server(&connection) == -1 ||
+        receive_welcome_message(&connection) == -1) {
+        close_connection(&connection, true);
         return 1;
     }
 
     if (ensure_download_directory(DOWNLOAD_DIRECTORY) == -1) {
         perror("prepare downloads directory");
-        close(client_fd);
+        close_connection(&connection, true);
         return 1;
     }
 
-    active_client_fd = client_fd;
+    active_connection = &connection;
 
     rl_variable_bind("horizontal-scroll-mode", "off");
     rl_callback_handler_install("> ", handle_input);
@@ -56,14 +61,16 @@ int main(void) {
                 .events = POLLIN
             },
             {
-                .fd = client_fd,
+                .fd = connection.socket_fd,
                 .events = POLLIN
             }
         };
+        bool tls_data_ready = SSL_pending(connection.ssl) > 0;
 
         int result;
         do {
-            result = poll(fds, 2, -1);
+            result = poll(fds, 2, tls_data_ready ? 0 /*Check events without waiting.*/: -1 /*Wait for an event.*/);
+
         } while (result == -1 && errno == EINTR);
 
         if (result == -1) {
@@ -72,10 +79,10 @@ int main(void) {
             break;
         }
 
-        if (fds[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
+        if (tls_data_ready || (fds[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
             unsigned char frame[FRAME_MAX_SIZE];
             ssize_t received = receive_frame(
-                client_fd,
+                &connection,
                 frame,
                 sizeof(frame)
             );
@@ -101,16 +108,10 @@ int main(void) {
 
     rl_clear_visible_line();
     rl_callback_handler_remove();
+    active_connection = NULL;
     cleanup_incoming_files();
 
-    if (shutdown(client_fd, SHUT_RDWR) == -1 && errno != ENOTCONN) {
-        perror("shutdown");
-    }
-
-    if (close(client_fd) == -1) {
-        perror("Socket closing failed");
-        return 1;
-    }
+    close_connection(&connection, true);
 
     printf("Socket successfully closed\n");
     return client_exit_code;
@@ -174,7 +175,7 @@ static void handle_input(char *line) {
         (line[5] == '\0' || isspace((unsigned char)line[5]));
 
     if (is_file_command) {
-        if (handle_file_command(active_client_fd, line) == -1) {
+        if (handle_file_command(active_connection, line) == -1) {
             int saved_errno = errno;
             fprintf(stderr, "File send failed: %s\n", strerror(saved_errno));
             if (is_connection_error(saved_errno)) {
@@ -187,7 +188,7 @@ static void handle_input(char *line) {
     }
 
     if (send_frame(
-            active_client_fd,
+            active_connection,
             FRAME_TEXT,
             line,
             strlen(line)
@@ -212,7 +213,7 @@ static bool is_connection_error(int error_number) {
         error_number == EBADF;
 }
 
-static int get_username_and_register_in_server(int client_fd) {
+static int get_username_and_register_in_server(Connection *connection) {
     char username[USERNAME_SIZE + 1];
 
     printf("Username: ");
@@ -249,17 +250,17 @@ static int get_username_and_register_in_server(int client_fd) {
         }
     }
 
-    if (send_message(client_fd, username, username_length) == -1) {
+    if (send_message(connection, username, username_length) == -1) {
         perror("send username");
         return -1;
     }
     return 0;
 }
 
-static int receive_welcome_message(int client_fd) {
+static int receive_welcome_message(Connection *connection) {
     char welcome_message[BUFFER_SIZE];
     ssize_t received = receive_message(
-        client_fd,
+        connection,
         welcome_message,
         sizeof(welcome_message)
     );
@@ -283,7 +284,7 @@ static int receive_welcome_message(int client_fd) {
     return 0;
 }
 
-static int handle_file_command(int client_fd, char *line) {
+static int handle_file_command(Connection *connection, char *line) {
     char *cursor = line + 5;
 
     while (isspace((unsigned char)*cursor)) {
@@ -318,5 +319,5 @@ static int handle_file_command(int client_fd, char *line) {
         return -1;
     }
 
-    return send_file(client_fd, recipient, cursor) == -1 ? -1 : 0;
+    return send_file(connection, recipient, cursor) == -1 ? -1 : 0;
 }

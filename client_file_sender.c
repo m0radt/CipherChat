@@ -19,20 +19,20 @@ static uint32_t create_transfer_id(void);
 static int get_regular_file_size(FILE *file, uint64_t *file_size);
 static const char *path_basename(const char *path);
 static int send_file_begin(
-    int socket_fd,
+    Connection *connection,
     uint32_t transfer_id,
     const char *recipient,
     const char *filename,
     uint64_t file_size
 );
 static int send_file_chunk(
-    int socket_fd,
+    Connection *connection,
     uint32_t transfer_id,
     const unsigned char *chunk,
     size_t chunk_length
 );
 static int send_file_control(
-    int socket_fd,
+    Connection *connection,
     FrameType type,
     uint32_t transfer_id
 );
@@ -93,7 +93,7 @@ static const char *path_basename(const char *path)
 }
 
 static int send_file_begin(
-    int socket_fd,
+    Connection *connection,
     uint32_t transfer_id,
     const char *recipient,
     const char *filename,
@@ -116,7 +116,7 @@ static int send_file_begin(
     }
 
     return send_frame(
-        socket_fd,
+        connection,
         FRAME_FILE_BEGIN,
         payload,
         payload_length
@@ -124,7 +124,7 @@ static int send_file_begin(
 }
 
 static int send_file_chunk(
-    int socket_fd,
+    Connection *connection,
     uint32_t transfer_id,
     const unsigned char *chunk,
     size_t chunk_length
@@ -145,7 +145,7 @@ static int send_file_chunk(
     }
 
     return send_frame(
-        socket_fd,
+        connection,
         FRAME_FILE_CHUNK,
         payload,
         payload_length
@@ -153,7 +153,7 @@ static int send_file_chunk(
 }
 
 static int send_file_control(
-    int socket_fd,
+    Connection *connection,
     FrameType type,
     uint32_t transfer_id
 )
@@ -176,14 +176,14 @@ static int send_file_control(
     }
 
     return send_frame(
-        socket_fd,
+        connection,
         type,
         payload,
         payload_length
     ) == -1 ? -1 : 0;
 }
 
-ssize_t send_file(int socket_fd, const char *recipient, const char *path)
+ssize_t send_file(Connection *connection, const char *recipient, const char *path)
 {
     FILE *file;
     const char *filename;
@@ -195,7 +195,7 @@ ssize_t send_file(int socket_fd, const char *recipient, const char *path)
     size_t bytes_read;
     int saved_errno;
 
-    if (socket_fd < 0 || recipient == NULL || path == NULL) {
+    if (connection == NULL || recipient == NULL || path == NULL) {
         errno = EINVAL;
         return -1;
     }
@@ -230,7 +230,7 @@ ssize_t send_file(int socket_fd, const char *recipient, const char *path)
 
     transfer_id = create_transfer_id();
     if (send_file_begin(
-            socket_fd,
+            connection,
             transfer_id,
             recipient,
             filename,
@@ -244,7 +244,7 @@ ssize_t send_file(int socket_fd, const char *recipient, const char *path)
 
     while ((bytes_read = fread(chunk, 1, sizeof(chunk), file)) > 0) {
         if (send_file_chunk(
-                socket_fd,
+                connection,
                 transfer_id,
                 chunk,
                 bytes_read
@@ -259,7 +259,7 @@ ssize_t send_file(int socket_fd, const char *recipient, const char *path)
     if (ferror(file)) {
         saved_errno = errno == 0 ? EIO : errno;
         (void)send_file_control(
-            socket_fd,
+            connection,
             FRAME_FILE_ERROR,
             transfer_id
         );
@@ -271,7 +271,7 @@ ssize_t send_file(int socket_fd, const char *recipient, const char *path)
     if (fclose(file) == EOF) {
         saved_errno = errno == 0 ? EIO : errno;
         (void)send_file_control(
-            socket_fd,
+            connection,
             FRAME_FILE_ERROR,
             transfer_id
         );
@@ -280,7 +280,7 @@ ssize_t send_file(int socket_fd, const char *recipient, const char *path)
     }
 
     if (send_file_control(
-            socket_fd,
+            connection,
             FRAME_FILE_END,
             transfer_id
         ) == -1) {

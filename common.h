@@ -1,7 +1,7 @@
 
 #ifndef COMMON_H
 #define COMMON_H
-
+#include "network.h"
 #include <unistd.h>
 #define BUFFER_SIZE 1024
 #define FRAME_MAX_SIZE BUFFER_SIZE
@@ -20,13 +20,12 @@ typedef enum {
     FRAME_TEXT
 } FrameType;
 
-ssize_t send_all(int socket_fd, const void *buff, size_t length);
-ssize_t recv_all(int socket_fd, void *buff, size_t length);
-ssize_t recv_string(int socket_fd, char *buff, size_t capacity);
-ssize_t send_message(int socket_fd, const char *message, size_t length);
-ssize_t receive_message(int socket_fd, char *buffer, size_t capacity);
-ssize_t send_frame(int socket_fd, FrameType type, const void *payload, size_t payload_length);
-ssize_t receive_frame(int socket_fd, unsigned char *frame, size_t capacity);
+ssize_t send_all(Connection *connection, const void *buff, size_t length);
+ssize_t recv_all(Connection *connection, void *buff, size_t length);
+ssize_t send_message(Connection *connection, const char *message, size_t length);
+ssize_t receive_message(Connection *connection, char *buffer, size_t capacity);
+ssize_t send_frame(Connection *connection, FrameType type, const void *payload, size_t payload_length);
+ssize_t receive_frame(Connection *connection, unsigned char *frame, size_t capacity);
 void set_timeout_for_socket(int socket_fd);
 void unset_timeout_for_socket(int socket_fd);
 int format_message(char *buffer, size_t capacity, const char *format, ...);

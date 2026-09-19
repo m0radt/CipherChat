@@ -16,3 +16,7 @@ __pycache__/
 *~
 .DS_Store
 Thumbs.db
+
+# SSL certificates and images
+certs
+*jpg

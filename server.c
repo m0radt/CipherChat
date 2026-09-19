@@ -4,6 +4,7 @@
 #include "network.h"
 #include "server_files.h"
 #include "server_messages.h"
+#include "server_worker.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -18,8 +19,14 @@ static volatile sig_atomic_t running = 1;
 static int server_fd = -1;
 
 static void *handle_client(void *argument);
-static int send_welcome_message(const char *username, int client_fd);
+static int send_welcome_message(const char *username, Connection *connection);
 static void stop_server(int signal_number);
+static bool handle_client_frame(
+    ClientId client_id,
+    const char *username,
+    const unsigned char *frame,
+    size_t length
+);
 static bool handle_command(
     ClientId client_id,
     const char *sender_username,
@@ -30,6 +37,10 @@ static bool handle_command(
 int main(void) {
     signal(SIGINT, stop_server);
     signal(SIGTERM, stop_server);
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        perror("ignore SIGPIPE");
+        return 1;
+    }
 
     init_clients();
     init_file_routes();
@@ -40,33 +51,33 @@ int main(void) {
     }
 
     while (running) {
-        int client_fd = accept_client(server_fd);
+        Connection connection;
 
-        if (client_fd == -1) {
+        if (accept_client(server_fd, &connection) == -1) {
             if (!running) {
                 break;
             }
             continue;
         }
 
-        int *client_fd_alloc = malloc(sizeof(*client_fd_alloc));
-        if (client_fd_alloc == NULL) {
-            perror("malloc client fd");
-            close(client_fd);
+        Connection *client_connection = malloc(sizeof(*client_connection));
+        if (client_connection == NULL) {
+            perror("malloc client connection");
+            close_connection(&connection, false);
             continue;
         }
-        *client_fd_alloc = client_fd;
+        *client_connection = connection;
 
         pthread_t receiver_thread;
         if (pthread_create(
                 &receiver_thread,
                 NULL,
                 handle_client,
-                client_fd_alloc
+                client_connection
             ) != 0) {
             perror("pthread_create");
-            free(client_fd_alloc);
-            close(client_fd);
+            free(client_connection);
+            close_connection(&connection, false);
             continue;
         }
 
@@ -87,43 +98,47 @@ int main(void) {
 }
 
 static void *handle_client(void *argument) {
-    int client_fd = *(int *)argument;
+    Connection connection = *(Connection *)argument;
     free(argument);
 
     char username[USERNAME_SIZE];
 
     printf("New client connected\n");
-    set_timeout_for_socket(client_fd);
+    set_timeout_for_socket(connection.socket_fd);
 
-    ssize_t received = receive_message(client_fd, username, sizeof(username));
+    if (perform_tls_handshake(&connection, 0, NULL) == -1) {
+        return NULL;
+    }
+
+    ssize_t received = receive_message(&connection, username, sizeof(username));
     if (received < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             const char *message = "Login failed: username timeout.\n";
-            (void)send_message(client_fd, message, strlen(message));
+            (void)send_message(&connection, message, strlen(message));
             fprintf(stderr, "Client login timed out\n");
         } else {
             perror("receive username");
         }
-        close(client_fd);
+        close_connection(&connection, true);
         return NULL;
     }
 
     if (received == 0) {
         printf("Client disconnected before login\n");
-        close(client_fd);
+        close_connection(&connection, true);
         return NULL;
     }
 
     if (memchr(username, '\0', (size_t)received) != NULL) {
         const char *message = "Login failed: invalid username.\n";
-        (void)send_message(client_fd, message, strlen(message));
-        close(client_fd);
+        (void)send_message(&connection, message, strlen(message));
+        close_connection(&connection, true);
         return NULL;
     }
 
-    unset_timeout_for_socket(client_fd);
+    unset_timeout_for_socket(connection.socket_fd);
 
-    int client_index = add_client(client_fd, username);
+    int client_index = add_client(&connection, username);
     if (client_index == -1) {
         char login_error[BUFFER_SIZE];
         const char *reason = errno == EEXIST
@@ -136,91 +151,68 @@ static void *handle_client(void *argument) {
             reason
         );
         if (written > 0 && (size_t)written < sizeof(login_error)) {
-            (void)send_message(client_fd, login_error, (size_t)written);
+            (void)send_message(&connection, login_error, (size_t)written);
         }
-        close(client_fd);
+        close_connection(&connection, true);
         return NULL;
     }
 
     ClientId client_id = get_client_id(client_index);
-    if (send_welcome_message(username, client_fd) == -1) {
-        remove_client(client_index);
+    if (send_welcome_message(username, &connection) == -1) {
+        remove_client(client_index, false);
         return NULL;
     }
     if (activate_client(client_index) == -1) {
-        remove_client(client_index);
+        remove_client(client_index, true);
         return NULL;
     }
 
     printf("Client \"%s\" logged in successfully\n", username);
 
-    while (true) {
-        unsigned char frame[FRAME_MAX_SIZE];
-        received = receive_frame(client_fd, frame, sizeof(frame));
-
-        if (received == -1) {
-            perror("receive frame from client");
-            break;
-        }
-        if (received == 0) {
-            printf("Client \"%s\" disconnected\n", username);
-            break;
-        }
-
-        FrameType type = (FrameType)frame[0];
-        if (type == FRAME_TEXT) {
-            size_t command_length = (size_t)received - 1;
-
-            if (command_length == 0 ||
-                memchr(frame + 1, '\0', command_length) != NULL) {
-                send_invalid_command(client_id, "binary text frame");
-                continue;
-            }
-
-            char command[FRAME_MAX_SIZE];
-            char original_command[FRAME_MAX_SIZE];
-            memcpy(command, frame + 1, command_length);
-            command[command_length] = '\0';
-            memcpy(original_command, command, command_length + 1);
-
-            printf(
-                "Received command from \"%s\": %s\n",
-                username,
-                original_command
-            );
-
-            if (!handle_command(
-                    client_id,
-                    username,
-                    command,
-                    original_command
-                )) {
-                break;
-            }
-            continue;
-        }
-
-        if (route_file_frame(
-                client_id,
-                username,
-                frame,
-                (size_t)received
-            ) == -1) {
-            fprintf(
-                stderr,
-                "Rejected file frame from \"%s\": %s\n",
-                username,
-                strerror(errno)
-            );
-        }
+    int worker_result = run_client_worker(&connection, client_id, username,
+                                          handle_client_frame);
+    if (worker_result == -1) {
+        perror("client worker");
     }
 
+    printf("Client \"%s\" disconnected\n", username);
+    /* Stop accepting new queued frames before notifying the other endpoints. */
+    remove_client(client_index, worker_result == 0);
     abort_file_routes_for_client(client_id);
-    remove_client(client_index);
     return NULL;
 }
 
-static int send_welcome_message(const char *username, int client_fd) {
+static bool handle_client_frame(
+    ClientId client_id,
+    const char *username,
+    const unsigned char *frame,
+    size_t length
+) {
+    if (frame[0] == FRAME_TEXT) {
+        size_t command_length = length - 1;
+        if (command_length == 0 ||
+            memchr(frame + 1, '\0', command_length) != NULL) {
+            send_invalid_command(client_id, "binary text frame");
+            return true;
+        }
+
+        char command[FRAME_MAX_SIZE];
+        char original_command[FRAME_MAX_SIZE];
+        memcpy(command, frame + 1, command_length);
+        command[command_length] = '\0';
+        memcpy(original_command, command, command_length + 1);
+        printf("Received command from \"%s\": %s\n", username, original_command);
+        return handle_command(client_id, username, command, original_command);
+    }
+
+    if (route_file_frame(client_id, username, frame, length) == -1) {
+        fprintf(stderr, "Rejected file frame from \"%s\": %s\n",
+                username, strerror(errno));
+    }
+    return true;
+}
+
+static int send_welcome_message(const char *username, Connection *connection) {
     char welcome_message[BUFFER_SIZE];
     int written = snprintf(
         welcome_message,
@@ -233,7 +225,7 @@ static int send_welcome_message(const char *username, int client_fd) {
         return -1;
     }
 
-    if (send_message(client_fd, welcome_message, (size_t)written) == -1) {
+    if (send_message(connection, welcome_message, (size_t)written) == -1) {
         perror("send welcome message");
         return -1;
     }

@@ -6,7 +6,8 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdarg.h>
-
+#include <openssl/err.h>
+#include <poll.h>
 
 static int is_valid_frame_type(FrameType type){
     switch (type) {
@@ -22,32 +23,68 @@ static int is_valid_frame_type(FrameType type){
 }
 
 
-ssize_t send_all(int socket_fd, const void *buff, size_t length){
-    if (buff == NULL && length != 0) {
+ssize_t send_all(Connection *connection, const void *buff, size_t length){
+    if (connection == NULL || connection->ssl == NULL ||
+        connection->socket_fd < 0 ||(buff == NULL && length != 0)) {
         errno = EINVAL;
         return -1;
     }
 
     const unsigned char *bytes = buff;
+    if (connection->tls_io_failed) {
+        errno = ECONNRESET;
+        return -1;
+    }
     size_t total_sent = 0;
 
     while (total_sent < length){
-        ssize_t bytes_sent = send(socket_fd, bytes + total_sent, length - total_sent, MSG_NOSIGNAL);
+        size_t written  = 0;
+        ERR_clear_error();
+        errno = 0;
 
-        if (bytes_sent < 0){
-            if (errno == EINTR) {
-                continue;
+        int result = SSL_write_ex(connection->ssl, bytes + total_sent, length - total_sent, &written);
+        int saved_errno = errno;
+
+        if (result == 1) {
+            total_sent += written;
+            continue;
+        }
+
+        int ssl_error = SSL_get_error(connection->ssl, result);
+
+        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+            struct pollfd pfd = {
+                .fd = connection->socket_fd,
+                .events = ssl_error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT
+            };
+            int ready = 0;
+            do{
+                ready = poll(&pfd, 1, -1);
+            } while (ready == -1 && errno == EINTR);
+
+            if (ready == -1) {
+                connection->tls_io_failed = true;
+                return -1;
             }
-
-            return -1;
+            if (pfd.revents & POLLNVAL) {
+                connection->tls_io_failed = true;
+                errno = EBADF;
+                return -1;
+            }
+            continue;
         }
-
-        if (bytes_sent == 0) {
+        if (ssl_error != SSL_ERROR_ZERO_RETURN) {
+            connection->tls_io_failed = true;
+        }
+        ERR_print_errors_fp(stderr);
+        if (ssl_error == SSL_ERROR_ZERO_RETURN) {
             errno = EPIPE;
-            return -1;
+        } else if (ssl_error == SSL_ERROR_SYSCALL && saved_errno != 0) {
+            errno = saved_errno;
+        } else {
+            errno = ECONNRESET;
         }
-
-        total_sent += (size_t) bytes_sent;
+        return -1;
     }
 
     return (ssize_t)total_sent;
@@ -56,7 +93,7 @@ ssize_t send_all(int socket_fd, const void *buff, size_t length){
 
 
 
-ssize_t send_message(int socket_fd, const char *message, size_t length){
+ssize_t send_message(Connection *connection, const char *message, size_t length){
 
     if (message == NULL || length == 0) {
         errno = EINVAL;
@@ -71,18 +108,18 @@ ssize_t send_message(int socket_fd, const char *message, size_t length){
 
     uint32_t network_length = htonl((uint32_t)length);
 
-    if (send_all(socket_fd, &network_length, sizeof(network_length)) == -1) {
+    if (send_all(connection, &network_length, sizeof(network_length)) == -1) {
         return -1;
     }
 
-    if (send_all(socket_fd, message, length) == -1) {
+    if (send_all(connection, message, length) == -1) {
         return -1;
     }
 
     return (ssize_t)length;
 }
 
-ssize_t send_frame(int socket_fd, FrameType type, const void *payload, size_t payload_length){
+ssize_t send_frame(Connection *connection, FrameType type, const void *payload, size_t payload_length){
     if (!is_valid_frame_type(type) ||
         (payload == NULL && payload_length != 0)) {
         errno = EINVAL;
@@ -98,53 +135,91 @@ ssize_t send_frame(int socket_fd, FrameType type, const void *payload, size_t pa
     uint32_t network_length = htonl((uint32_t)frame_length);
     unsigned char frame_type = (unsigned char)type;
 
-    if (send_all(socket_fd, &network_length, sizeof(network_length)) == -1) {
+    if (send_all(connection, &network_length, sizeof(network_length)) == -1) {
         return -1;
     }
 
-    if (send_all(socket_fd, &frame_type, sizeof(frame_type)) == -1) {
+    if (send_all(connection, &frame_type, sizeof(frame_type)) == -1) {
         return -1;
     }
 
     if (payload_length != 0 &&
-        send_all(socket_fd, payload, payload_length) == -1) {
+        send_all(connection, payload, payload_length) == -1) {
         return -1;
     }
 
     return (ssize_t)frame_length;
 }
 
-ssize_t recv_all(int socket_fd, void *buff, size_t length){
-    if (buff == NULL && length != 0) {
+ssize_t recv_all(Connection *connection, void *buff, size_t length) {
+    if (connection == NULL || connection->ssl == NULL ||
+        connection->socket_fd < 0 || (buff == NULL && length != 0)) {
         errno = EINVAL;
         return -1;
     }
 
     unsigned char *bytes = buff;
+    if (connection->tls_io_failed) {
+        errno = ECONNRESET;
+        return -1;
+    }
     size_t total_received = 0;
 
-    while (total_received < length){
-        ssize_t bytes_received = recv(socket_fd, bytes + total_received, length - total_received, 0);
+    while (total_received < length) {
+        size_t bytes_received = 0;
 
-        if (bytes_received < 0){
-            if (errno == EINTR) {
-                continue;
-            }
+        ERR_clear_error();
+        errno = 0;
 
-            return -1;
+        int result = SSL_read_ex(
+            connection->ssl,
+            bytes + total_received,
+            length - total_received,
+            &bytes_received
+        );
+        int saved_errno = errno;
+
+        if (result == 1) {
+            total_received += bytes_received;
+            continue;
         }
 
-        if (bytes_received == 0) {
+        int error = SSL_get_error(connection->ssl, result);
+
+        if (error == SSL_ERROR_ZERO_RETURN) {
             break;
         }
 
-        total_received += (size_t) bytes_received;
+        if (error == SSL_ERROR_WANT_READ ||
+            error == SSL_ERROR_WANT_WRITE) {
+            /* On our blocking sockets, this indicates a timeout. */
+            if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) {
+                if (error == SSL_ERROR_WANT_WRITE) {
+                    connection->tls_io_failed = true;
+                }
+                errno = saved_errno;
+                return -1;
+            }
+
+            continue;
+        }
+
+        connection->tls_io_failed = true;
+        ERR_print_errors_fp(stderr);
+
+        if (error == SSL_ERROR_SYSCALL && saved_errno != 0) {
+            errno = saved_errno;
+        } else {
+            errno = ECONNRESET;
+        }
+
+        return -1;
     }
 
     return (ssize_t)total_received;
 }
 
-ssize_t receive_message(int socket_fd, char *buffer, size_t capacity) {
+ssize_t receive_message(Connection *connection, char *buffer, size_t capacity) {
     if (buffer == NULL || capacity < 2) {
         errno = EINVAL;
         return -1;
@@ -152,7 +227,7 @@ ssize_t receive_message(int socket_fd, char *buffer, size_t capacity) {
 
     uint32_t network_length;
 
-    ssize_t header_bytes = recv_all(socket_fd, &network_length, sizeof(network_length));
+    ssize_t header_bytes = recv_all(connection, &network_length, sizeof(network_length));
 
     if (header_bytes == 0) {
         /* Clean disconnection before a new field/message. */
@@ -177,7 +252,7 @@ ssize_t receive_message(int socket_fd, char *buffer, size_t capacity) {
         return -1;
     }
 
-    ssize_t payload_bytes = recv_all(socket_fd, buffer, message_length);
+    ssize_t payload_bytes = recv_all(connection, buffer, message_length);
 
     if (payload_bytes != (ssize_t)message_length) {
         if (payload_bytes >= 0) {
@@ -192,7 +267,7 @@ ssize_t receive_message(int socket_fd, char *buffer, size_t capacity) {
     return (ssize_t)message_length;
 }
 
-ssize_t receive_frame(int socket_fd, unsigned char *frame, size_t capacity){
+ssize_t receive_frame(Connection *connection, unsigned char *frame, size_t capacity){
     if (frame == NULL || capacity == 0) {
         errno = EINVAL;
         return -1;
@@ -200,7 +275,7 @@ ssize_t receive_frame(int socket_fd, unsigned char *frame, size_t capacity){
 
     uint32_t network_length;
     ssize_t header_bytes = recv_all(
-        socket_fd,
+        connection,
         &network_length,
         sizeof(network_length)
     );
@@ -226,7 +301,7 @@ ssize_t receive_frame(int socket_fd, unsigned char *frame, size_t capacity){
         return -1;
     }
 
-    ssize_t frame_bytes = recv_all(socket_fd, frame, frame_length);
+    ssize_t frame_bytes = recv_all(connection, frame, frame_length);
 
     if (frame_bytes != (ssize_t)frame_length) {
         if (frame_bytes >= 0) {
@@ -244,25 +319,6 @@ ssize_t receive_frame(int socket_fd, unsigned char *frame, size_t capacity){
     return frame_bytes;
 }
 
-ssize_t recv_string(int socket_fd, char *buff, size_t capacity){
-    /*we assume that the buff contain null terminator for the must part*/
-    size_t total_received = 0;
-    while (total_received < capacity){
-        ssize_t bytes_received = recv(socket_fd, buff + total_received, 1, 0);
-        if (bytes_received < 0){
-            return -1;
-        }
-        if (bytes_received == 0){
-            /* Peer disconnected before completing the message. */
-            return 0;
-        }
-        if(buff[total_received] == '\0'){
-            return (ssize_t)(total_received + 1);
-        }
-        total_received ++;
-    }
-    return -1;
-}
 
 
 void set_timeout_for_socket(int socket_fd){

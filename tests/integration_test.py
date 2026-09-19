@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end checks for typed chat frames and routed binary files."""
+"""End-to-end checks for typed chat frames and binary files over TLS 1.3."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import ssl
 import struct
 import subprocess
 import tempfile
@@ -101,7 +102,13 @@ def parse_begin(payload: bytes) -> tuple[int, int, str, str]:
     )
 
 
-def connect_client(username: str, deadline: float | None = None) -> socket.socket:
+def connect_client(username: str, deadline: float | None = None) -> ssl.SSLSocket:
+    context = ssl.create_default_context(
+        cafile=str(ROOT / "certs" / "server.crt")
+    )
+    context.minimum_version = ssl.TLSVersion.TLSv1_3
+    context.maximum_version = ssl.TLSVersion.TLSv1_3
+
     if deadline is None:
         deadline = time.monotonic() + 3
 
@@ -117,10 +124,16 @@ def connect_client(username: str, deadline: float | None = None) -> socket.socke
                 raise
             time.sleep(0.03)
 
-    send_legacy_message(sock, username.encode())
-    welcome = receive_legacy_message(sock)
-    assert welcome.startswith(b"Welcome to CipherChat"), welcome
-    return sock
+    try:
+        sock = context.wrap_socket(sock, server_hostname=HOST)
+        assert sock.version() == "TLSv1.3", sock.version()
+        send_legacy_message(sock, username.encode())
+        welcome = receive_legacy_message(sock)
+        assert welcome.startswith(b"Welcome to CipherChat"), welcome
+        return sock
+    except Exception:
+        sock.close()
+        raise
 
 
 def receive_text_containing(sock: socket.socket, needle: bytes) -> bytes:
@@ -325,6 +338,14 @@ def run_real_client_check() -> None:
     receiver_directory = work_directory / "receiver"
     sender_directory.mkdir()
     receiver_directory.mkdir()
+
+    for directory in (sender_directory, receiver_directory):
+        certificate_directory = directory / "certs"
+        certificate_directory.mkdir()
+        shutil.copy2(
+            ROOT / "certs" / "server.crt",
+            certificate_directory / "server.crt",
+        )
 
     content = os.urandom(FILE_CHUNK_SIZE * 3 + 37) + b"\x00\xffend"
     source_file = sender_directory / "client-e2e.bin"
