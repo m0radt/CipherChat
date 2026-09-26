@@ -84,6 +84,45 @@ class TLSLifecycleTests(unittest.TestCase):
         send_legacy_message(peer, b"Welcome to CipherChat, lifecycle!\n")
         return peer
 
+    def test_client_parses_only_private_messages(self):
+        with self.listener() as listener:
+            process = self.start_client()
+            peer = self.accept_client(listener, process)
+            cases = (
+                ("/msg sara hello there", b"/msg sara hello there"),
+                ("  /msg\t sara\t hello  there", b"/msg sara hello  there"),
+                ("/msg " + "x" * 31 + " hello",
+                 b"/msg " + b"x" * 31 + b" hello"),
+                ("/msgx sara hello", b"/msgx sara hello"),
+                ("  /broadcast   hello  all", b"  /broadcast   hello  all"),
+                ("/broadcast", b"/broadcast"),
+                ("/help", b"/help"),
+            )
+            for command, payload in cases:
+                with self.subTest(command=command):
+                    process.stdin.write(command + "\n")
+                    process.stdin.flush()
+                    self.assertEqual(receive_frame(peer), (FRAME_TEXT, payload))
+
+            invalid = ("/msg", "/msg sara", "/msg sara   ",
+                       "/msg " + "x" * 32 + " hello",
+                       "/msg sara " + "x" * 1024)
+            for command in invalid:
+                with self.subTest(command=command[:60]):
+                    process.stdin.write(command + "\n/list\n")
+                    process.stdin.flush()
+                    # Invalid /msg input is rejected before reaching the server.
+                    self.assertEqual(receive_frame(peer), (FRAME_TEXT, b"/list"))
+
+            process.stdin.write("/quit\n")
+            process.stdin.flush()
+            self.assertEqual(receive_frame(peer), (FRAME_TEXT, b"/quit"))
+            with peer.unwrap() as transport:
+                self.assertEqual(transport.recv(1), b"")
+            output, _ = process.communicate(timeout=3)
+            self.assertEqual(process.returncode, 0, output)
+            self.assertIn("Usage: /msg <username> <message>", output)
+
     def test_client_deadline_with_silent_and_trickling_servers(self):
         with self.listener() as listener:
             started = time.monotonic()

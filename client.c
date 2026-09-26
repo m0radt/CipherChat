@@ -1,4 +1,5 @@
 #include "client_files.h"
+#include "command_parser.h"
 #include "common.h"
 #include "network.h"
 
@@ -26,6 +27,7 @@ static bool is_connection_error(int error_number);
 static int get_username_and_register_in_server(Connection *connection);
 static int receive_welcome_message(Connection *connection);
 static int handle_file_command(Connection *connection, char *line);
+static int handle_private_message(Connection *connection, char *line);
 
 int main(void) {
     if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
@@ -187,6 +189,25 @@ static void handle_input(char *line) {
         return;
     }
 
+    const char *verb = line;
+    while (isspace((unsigned char)*verb)) {
+        verb++;
+    }
+    bool is_private_message = strncmp(verb, "/msg", 4) == 0 &&
+        (verb[4] == '\0' || isspace((unsigned char)verb[4]));
+    if (is_private_message) {
+        if (handle_private_message(active_connection, line) == -1) {
+            int saved_errno = errno;
+            fprintf(stderr, "Private message failed: %s\n", strerror(saved_errno));
+            if (is_connection_error(saved_errno)) {
+                client_exit_code = 1;
+                connected = false;
+            }
+        }
+        free(line);
+        return;
+    }
+
     if (send_frame(
             active_connection,
             FRAME_TEXT,
@@ -204,6 +225,26 @@ static void handle_input(char *line) {
     }
 
     free(line);
+}
+
+static int handle_private_message(Connection *connection, char *line) {
+    ParsedCommand parsed = parse_command(line);
+    if (parsed.type != CMD_PRIVATE_MESSAGE) {
+        fprintf(stderr, "Usage: /msg <username> <message>\n");
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* Recipient and message are now separate; retain the existing wire format. */
+    char command[FRAME_MAX_SIZE];
+    int length = snprintf(command, sizeof(command), "/msg %s %s",
+                          parsed.username, parsed.message);
+    if (length < 0 || (size_t)length >= sizeof(command)) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+    return send_frame(connection, FRAME_TEXT, command, (size_t)length) == -1
+        ? -1 : 0;
 }
 
 static bool is_connection_error(int error_number) {
