@@ -140,7 +140,7 @@ int run_client_worker(
                         needed += length;
                     } else {
                         const unsigned char *frame = incoming + sizeof(uint32_t);
-                        if (frame[0] > FRAME_TEXT) {
+                        if (!is_valid_frame_type((FrameType)frame[0])) {
                             errno = EPROTO;
                             return -1;
                         }

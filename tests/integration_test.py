@@ -18,14 +18,20 @@ ROOT = Path(__file__).resolve().parents[1]
 SERVER = Path(os.environ.get("TCP_CHAT_SERVER", ROOT / "server"))
 CLIENT = Path(os.environ.get("TCP_CHAT_CLIENT", ROOT / "client"))
 HOST = "127.0.0.1"
-PORT = 8080
+PORT = int(os.environ.get("TCP_CHAT_PORT", "8080"))
 
 FRAME_FILE_BEGIN = 0
 FRAME_FILE_CHUNK = 1
 FRAME_FILE_END = 2
 FRAME_FILE_ERROR = 3
 FRAME_TEXT = 4
+FRAME_REQUEST_PK = 5
+FRAME_PEER_PK = 6
+FRAME_CIPHERTEXT = 7
+FRAME_REGISTER_PK = 8
 FILE_CHUNK_SIZE = 900
+MESSAGE_MAX_SIZE = 64 * 1024
+FRAME_MAX_SIZE = MESSAGE_MAX_SIZE + 256
 
 
 def receive_exact(sock: socket.socket, length: int) -> bytes:
@@ -60,7 +66,7 @@ def send_frame(sock: socket.socket, frame_type: int, payload: bytes = b"") -> No
 
 def receive_frame(sock: socket.socket) -> tuple[int, bytes]:
     (length,) = struct.unpack("!I", receive_exact(sock, 4))
-    assert 1 <= length <= 1024, f"invalid frame length {length}"
+    assert 1 <= length <= FRAME_MAX_SIZE, f"invalid frame length {length}"
     frame = receive_exact(sock, length)
     return frame[0], frame[1:]
 
@@ -436,10 +442,10 @@ def main() -> None:
     else:
         server.terminate()
         try:
-            server.wait(timeout=2)
+            server.communicate(timeout=2)
         except subprocess.TimeoutExpired:
             server.kill()
-            server.wait()
+            server.communicate()
 
     print("integration tests passed")
 

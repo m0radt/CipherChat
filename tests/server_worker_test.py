@@ -11,7 +11,7 @@ import time
 import unittest
 
 from integration_test import (
-    FRAME_FILE_BEGIN, FRAME_FILE_END, FRAME_FILE_ERROR, FRAME_TEXT,
+    FRAME_FILE_BEGIN, FRAME_FILE_END, FRAME_FILE_ERROR, FRAME_MAX_SIZE, FRAME_TEXT,
     HOST, PORT, encode_frame, make_begin, parse_begin, receive_frame,
     receive_legacy_message, send_frame, send_legacy_message,
 )
@@ -166,7 +166,7 @@ class ServerWorkerTests(unittest.TestCase):
     def test_invalid_frame_headers_and_types_disconnect_only_sender(self):
         healthy = self.connect("healthy")
         for i, invalid in enumerate((struct.pack("!I", 0),
-                                     struct.pack("!I", 1025),
+                                     struct.pack("!I", FRAME_MAX_SIZE + 1),
                                      encode_frame(255))):
             bad = self.connect(f"bad{i}")
             bad.sendall(invalid)

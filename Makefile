@@ -16,13 +16,14 @@ server: $(SERVER_SOURCES) common.h file_protocol.h network.h client_manager.h \
 	$(CC) $(CFLAGS) $(SERVER_SOURCES) -o server -lssl -lcrypto
 
 client: $(CLIENT_SOURCES) client_files.h common.h file_protocol.h network.h command_parser.h
-	$(CC) $(CFLAGS) $(CLIENT_SOURCES) -o client -lreadline -lssl -lcrypto
+	$(CC) $(CFLAGS) $(CLIENT_SOURCES) -o client -lreadline -lssl -lcrypto -lsodium
 
 test: all
 	python3 tests/integration_test.py
 	python3 tests/tls_failure_test.py
 	python3 tests/server_worker_test.py
 	python3 tests/tls_lifecycle_test.py
+	python3 tests/e2ee_test.py
 
 clean:
 	rm -f server client

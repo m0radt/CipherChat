@@ -31,8 +31,8 @@ from integration_test import (
 
 IO_TIMEOUT = 3
 CLIENT_TIMEOUT = 5
-# Handshake deadlines and the separate username receive timeout are 10 seconds.
-STALL_TIMEOUT = 15
+# Handshake deadlines are 10 seconds; the username receive timeout is 30 seconds.
+STALL_TIMEOUT = 35
 
 
 def create_certificate(directory: Path, ip_address: str) -> Path:

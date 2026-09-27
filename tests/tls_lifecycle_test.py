@@ -14,7 +14,7 @@ import time
 import unittest
 
 from integration_test import (
-    CLIENT, FRAME_TEXT, HOST, PORT, receive_exact, receive_frame,
+    CLIENT, FRAME_REGISTER_PK, FRAME_REQUEST_PK, FRAME_TEXT, HOST, MESSAGE_MAX_SIZE, PORT, receive_exact, receive_frame,
     receive_legacy_message, send_frame, send_legacy_message,
 )
 from tls_failure_test import (
@@ -22,7 +22,7 @@ from tls_failure_test import (
 )
 
 
-class TLSLifecycleTests(unittest.TestCase):
+class TLSClientTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         temporary = tempfile.TemporaryDirectory(prefix="cipherchat-lifecycle-")
@@ -61,12 +61,13 @@ class TLSLifecycleTests(unittest.TestCase):
         self.assertTrue(receive_legacy_message(peer).startswith(b"Welcome"))
         return peer
 
-    def start_client(self):
-        process = subprocess.Popen(
+    def start_client(self, *, stdout=subprocess.PIPE):
+        process = self.enterContext(subprocess.Popen(
             [str(CLIENT.resolve())], cwd=self.client_directory,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stdin=subprocess.PIPE, stdout=stdout,
             stderr=subprocess.STDOUT, text=True,
-        )
+        ))
+        # Stop before Popen's context cleanup closes streams and waits for exit.
         self.addCleanup(stop_process, process)
         return process
 
@@ -82,31 +83,38 @@ class TLSLifecycleTests(unittest.TestCase):
         process.stdin.flush()
         self.assertEqual(receive_legacy_message(peer), b"lifecycle")
         send_legacy_message(peer, b"Welcome to CipherChat, lifecycle!\n")
+        kind, public_key = receive_frame(peer)
+        self.assertEqual(kind, FRAME_REGISTER_PK)
+        self.assertEqual(len(public_key), 32)
+        process.public_key = public_key
         return peer
 
+
+class TLSLifecycleTests(TLSClientTestCase):
     def test_client_parses_only_private_messages(self):
+        # Readline can echo more than a pipe can hold before we read the output.
+        output_file = self.enterContext(tempfile.TemporaryFile(mode="w+t"))
         with self.listener() as listener:
-            process = self.start_client()
+            process = self.start_client(stdout=output_file)
             peer = self.accept_client(listener, process)
             cases = (
-                ("/msg sara hello there", b"/msg sara hello there"),
-                ("  /msg\t sara\t hello  there", b"/msg sara hello  there"),
-                ("/msg " + "x" * 31 + " hello",
-                 b"/msg " + b"x" * 31 + b" hello"),
-                ("/msgx sara hello", b"/msgx sara hello"),
-                ("  /broadcast   hello  all", b"  /broadcast   hello  all"),
-                ("/broadcast", b"/broadcast"),
-                ("/help", b"/help"),
+                ("/msg sara hello there", FRAME_REQUEST_PK, b"sara"),
+                ("  /msg\t sara\t hello  there", FRAME_REQUEST_PK, b"sara"),
+                ("/msg " + "x" * 31 + " hello", FRAME_REQUEST_PK, b"x" * 31),
+                ("/msgx sara hello", FRAME_TEXT, b"/msgx sara hello"),
+                ("  /broadcast   hello  all", FRAME_TEXT, b"  /broadcast   hello  all"),
+                ("/broadcast", FRAME_TEXT, b"/broadcast"),
+                ("/help", FRAME_TEXT, b"/help"),
             )
-            for command, payload in cases:
+            for command, frame_type, payload in cases:
                 with self.subTest(command=command):
                     process.stdin.write(command + "\n")
                     process.stdin.flush()
-                    self.assertEqual(receive_frame(peer), (FRAME_TEXT, payload))
+                    self.assertEqual(receive_frame(peer), (frame_type, payload))
 
             invalid = ("/msg", "/msg sara", "/msg sara   ",
                        "/msg " + "x" * 32 + " hello",
-                       "/msg sara " + "x" * 1024)
+                       "/msg sara " + "x" * (MESSAGE_MAX_SIZE + 1))
             for command in invalid:
                 with self.subTest(command=command[:60]):
                     process.stdin.write(command + "\n/list\n")
@@ -119,7 +127,9 @@ class TLSLifecycleTests(unittest.TestCase):
             self.assertEqual(receive_frame(peer), (FRAME_TEXT, b"/quit"))
             with peer.unwrap() as transport:
                 self.assertEqual(transport.recv(1), b"")
-            output, _ = process.communicate(timeout=3)
+            process.communicate(timeout=3)
+            output_file.seek(0)
+            output = output_file.read()
             self.assertEqual(process.returncode, 0, output)
             self.assertIn("Usage: /msg <username> <message>", output)
 

@@ -9,12 +9,16 @@
 #include <openssl/err.h>
 #include <poll.h>
 
-static int is_valid_frame_type(FrameType type){
+int is_valid_frame_type(FrameType type){
     switch (type) {
     case FRAME_FILE_BEGIN:
     case FRAME_FILE_CHUNK:
     case FRAME_FILE_END:
     case FRAME_FILE_ERROR:
+    case FRAME_REQUEST_PK:
+    case FRAME_PEER_PK:
+    case FRAME_CIPHERTEXT:
+    case FRAME_REGISTER_PK:
     case FRAME_TEXT:
         return 1;
     }
@@ -100,8 +104,7 @@ ssize_t send_message(Connection *connection, const char *message, size_t length)
         return -1;
     }
 
-    /* Text receivers need one additional byte for the null terminator. */
-    if (length >= BUFFER_SIZE) {
+    if (length > MESSAGE_MAX_SIZE) {
         errno = EMSGSIZE;
         return -1;
     }
@@ -246,7 +249,7 @@ ssize_t receive_message(Connection *connection, char *buffer, size_t capacity) {
     uint32_t message_length = ntohl(network_length);
 
     if (message_length == 0 ||
-        message_length >= BUFFER_SIZE ||
+        message_length > MESSAGE_MAX_SIZE ||
         message_length >= capacity) {
         errno = EMSGSIZE;
         return -1;

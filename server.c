@@ -6,6 +6,7 @@
 #include "server_messages.h"
 #include "server_worker.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
@@ -182,6 +183,104 @@ static void *handle_client(void *argument) {
     return NULL;
 }
 
+/* Usernames are length-delimited on the wire and cannot contain controls. */
+static bool copy_peer_name(char *name, const unsigned char *bytes, size_t length) {
+    if (length == 0 || length >= USERNAME_SIZE) {
+        return false;
+    }
+    for (size_t i = 0; i < length; i++) {
+        if (isspace(bytes[i]) || iscntrl(bytes[i])) {
+            return false;
+        }
+    }
+    memcpy(name, bytes, length);
+    name[length] = '\0';
+    return true;
+}
+
+static void handle_encrypted_chat(ClientId client_id,
+                                  const char *sender_username,
+                                  const unsigned char *frame, size_t length) {
+    FrameType type = (FrameType)frame[0];
+    const unsigned char *payload = frame + 1;
+    size_t payload_length = length - 1;
+    char recipient[USERNAME_SIZE];
+
+    if (type == FRAME_REGISTER_PK) {
+        if (payload_length != CHAT_PUBLIC_KEY_SIZE ||
+            register_client_public_key(client_id, payload) == -1) {
+            send_invalid_command(client_id, "public key registration");
+        }
+        return;
+    }
+
+    if (type == FRAME_REQUEST_PK) {
+        if (!copy_peer_name(recipient, payload, payload_length)) {
+            send_invalid_command(client_id, "public key request");
+            return;
+        }
+        unsigned char response[1 + USERNAME_SIZE - 1 + CHAT_PUBLIC_KEY_SIZE];
+        response[0] = (unsigned char)payload_length;
+        memcpy(response + 1, payload, payload_length);
+        size_t response_length = 1 + payload_length;
+        ClientId recipient_id = find_client_id(recipient);
+        if (get_client_public_key(recipient_id, response + response_length) == 0) {
+            response_length += CHAT_PUBLIC_KEY_SIZE;
+        }
+        /* A name-only reply cancels this request when the peer/key is absent. */
+        (void)send_frame_to_client_id(client_id, FRAME_PEER_PK,
+                                      response, response_length);
+        return;
+    }
+
+    if (payload_length < CHAT_OVERHEAD ||
+        payload_length < CHAT_OVERHEAD + (size_t)payload[0] ||
+        !copy_peer_name(recipient, payload + 1, payload[0])) {
+        send_invalid_command(client_id, "encrypted message");
+        return;
+    }
+    size_t recipient_length = payload[0];
+    size_t encrypted_offset = 1 + recipient_length;
+    size_t encrypted_length = payload_length - encrypted_offset;
+    size_t message_length = encrypted_length - CHAT_NONCE_SIZE -
+        CHAT_PUBLIC_KEY_SIZE - CHAT_MAC_SIZE;
+    if (message_length > CHAT_MAX_MESSAGE_SIZE) {
+        send_invalid_command(client_id, "encrypted message too long");
+        return;
+    }
+
+    unsigned char sender_key[CHAT_PUBLIC_KEY_SIZE];
+    const unsigned char *claimed_key = payload + encrypted_offset + CHAT_NONCE_SIZE;
+    if (get_client_public_key(client_id, sender_key) == -1 ||
+        memcmp(sender_key, claimed_key, CHAT_PUBLIC_KEY_SIZE) != 0) {
+        send_invalid_command(client_id, "encrypted message sender key");
+        return;
+    }
+    size_t sender_length = strlen(sender_username);
+    size_t forwarded_length = 1 + sender_length + encrypted_length;
+    if (sender_length == 0 || sender_length >= USERNAME_SIZE ||
+        forwarded_length > FRAME_MAX_SIZE - 1) {
+        send_invalid_command(client_id, "encrypted message sender");
+        return;
+    }
+
+    /* Replace the routing recipient with the authenticated login name. */
+    unsigned char forwarded[FRAME_MAX_SIZE - 1];
+    forwarded[0] = (unsigned char)sender_length;
+    memcpy(forwarded + 1, sender_username, sender_length);
+    memcpy(forwarded + 1 + sender_length,
+           payload + encrypted_offset, encrypted_length);
+
+    ClientId recipient_id = find_client_id(recipient);
+    if (send_frame_to_client_id(recipient_id, FRAME_CIPHERTEXT,
+                               forwarded, forwarded_length) == -1) {
+        char error[BUFFER_SIZE];
+        if (format_message(error, sizeof(error), MSG_USER_NOT_FOUND, recipient) != -1) {
+            (void)send_text_to_client_id(client_id, error);
+        }
+    }
+}
+
 static bool handle_client_frame(
     ClientId client_id,
     const char *username,
@@ -203,6 +302,16 @@ static bool handle_client_frame(
         memcpy(original_command, command, command_length + 1);
         printf("Received command from \"%s\": %s\n", username, original_command);
         return handle_command(client_id, username, command, original_command);
+    }
+
+    if (frame[0] == FRAME_REGISTER_PK || frame[0] == FRAME_REQUEST_PK ||
+        frame[0] == FRAME_CIPHERTEXT) {
+        handle_encrypted_chat(client_id, username, frame, length);
+        return true;
+    }
+    if (frame[0] == FRAME_PEER_PK) {
+        send_invalid_command(client_id, "unexpected public key reply");
+        return true;
     }
 
     if (route_file_frame(client_id, username, frame, length) == -1) {
@@ -252,7 +361,12 @@ static bool handle_command(
 
     switch (parsed.type) {
     case CMD_PRIVATE_MESSAGE: {
-        char private_message[BUFFER_SIZE];
+        char private_message[FRAME_MAX_SIZE];
+        if (strlen(parsed.message) > MESSAGE_MAX_SIZE) {
+            (void)send_text_to_client_id(client_id,
+                "Message too long (maximum: 65536 bytes)\n");
+            break;
+        }
         if (format_message(
                 private_message,
                 sizeof(private_message),
@@ -270,7 +384,12 @@ static bool handle_command(
     }
 
     case CMD_BROADCAST_MESSAGE: {
-        char broadcast_message[BUFFER_SIZE];
+        char broadcast_message[FRAME_MAX_SIZE];
+        if (strlen(parsed.message) > MESSAGE_MAX_SIZE) {
+            (void)send_text_to_client_id(client_id,
+                "Message too long (maximum: 65536 bytes)\n");
+            break;
+        }
         if (format_message(
                 broadcast_message,
                 sizeof(broadcast_message),

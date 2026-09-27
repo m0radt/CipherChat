@@ -26,8 +26,8 @@ int queue_frame_to_client_id(
 typedef struct OutgoingFrame {
     FrameType type;
     size_t payload_length;
-    unsigned char payload[FRAME_MAX_SIZE - 1];
     struct OutgoingFrame *next;
+    unsigned char payload[];
 } OutgoingFrame;
 
 typedef struct {
@@ -37,6 +37,8 @@ typedef struct {
     bool active;
     bool ready;
     ClientId id;
+    unsigned char public_key[CHAT_PUBLIC_KEY_SIZE];
+    bool has_public_key;
     OutgoingFrame *outgoing_head;
     OutgoingFrame *outgoing_tail;
     size_t outgoing_count;
@@ -49,6 +51,8 @@ int activate_client(int index);
 void remove_client(int index, bool graceful);
 ClientId get_client_id(int index);
 ClientId find_client_id(const char *username);
+int register_client_public_key(ClientId client_id, const unsigned char *key);
+int get_client_public_key(ClientId client_id, unsigned char *key);
 /* Borrowed descriptor: only the owning worker uses it, until remove_client(). */
 int get_client_wake_fd(ClientId client_id);
 int client_output_status(ClientId client_id);

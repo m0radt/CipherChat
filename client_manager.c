@@ -54,6 +54,7 @@ void init_clients(void) {
         clients[i].active = false;
         clients[i].ready = false;
         clients[i].id = INVALID_CLIENT_ID;
+        clients[i].has_public_key = false;
         clients[i].outgoing_head = NULL;
         clients[i].outgoing_tail = NULL;
         clients[i].outgoing_count = 0;
@@ -105,6 +106,7 @@ int add_client(Connection *connection, const char *username) {
     clients[free_index].active = true;
     clients[free_index].ready = false;
     clients[free_index].id = allocate_client_id();
+    clients[free_index].has_public_key = false;
     memcpy(clients[free_index].username, username, strlen(username) + 1);
 
     pthread_mutex_unlock(&clients_mutex);
@@ -149,6 +151,8 @@ void remove_client(int index, bool graceful) {
     clients[index].active = false;
     clients[index].ready = false;
     clients[index].id = INVALID_CLIENT_ID;
+    clients[index].has_public_key = false;
+    memset(clients[index].public_key, 0, sizeof(clients[index].public_key));
     OutgoingFrame *pending = clients[index].outgoing_head;
 
     clients[index].outgoing_head = NULL;
@@ -202,6 +206,44 @@ ClientId find_client_id(const char *username) {
 
     pthread_mutex_unlock(&clients_mutex);
     return INVALID_CLIENT_ID;
+}
+
+int register_client_public_key(ClientId client_id, const unsigned char *key) {
+    pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        Client *client = &clients[i];
+        if (client->active && client->ready && client->id == client_id) {
+            if (client->has_public_key &&
+                memcmp(client->public_key, key, CHAT_PUBLIC_KEY_SIZE) != 0) {
+                pthread_mutex_unlock(&clients_mutex);
+                errno = EINVAL;
+                return -1;
+            }
+            memcpy(client->public_key, key, CHAT_PUBLIC_KEY_SIZE);
+            client->has_public_key = true;
+            pthread_mutex_unlock(&clients_mutex);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+    errno = ENOENT;
+    return -1;
+}
+
+int get_client_public_key(ClientId client_id, unsigned char *key) {
+    pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        Client *client = &clients[i];
+        if (client->active && client->ready && client->id == client_id &&
+            client->has_public_key) {
+            memcpy(key, client->public_key, CHAT_PUBLIC_KEY_SIZE);
+            pthread_mutex_unlock(&clients_mutex);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+    errno = ENOENT;
+    return -1;
 }
 
 int send_frame_to_client_id(
@@ -349,7 +391,7 @@ int queue_frame_to_client_id(
     size_t payload_length
 ) {
     if (client_id == INVALID_CLIENT_ID ||
-        (unsigned int)type > (unsigned int)FRAME_TEXT ||
+        !is_valid_frame_type(type) ||
         (payload == NULL && payload_length != 0)) {
         errno = EINVAL;
         return -1;
@@ -360,7 +402,7 @@ int queue_frame_to_client_id(
         return -1;
     }
 
-    OutgoingFrame *frame = malloc(sizeof(*frame));
+    OutgoingFrame *frame = malloc(sizeof(*frame) + payload_length);
     if (frame == NULL) {
         errno = ENOMEM;
         return -1;

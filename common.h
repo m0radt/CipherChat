@@ -4,21 +4,38 @@
 #include "network.h"
 #include <unistd.h>
 #define BUFFER_SIZE 1024
-#define FRAME_MAX_SIZE BUFFER_SIZE
+#define MESSAGE_MAX_SIZE (64U * 1024U)
+/* Leave room for command, username, and encryption metadata. */
+#define FRAME_MAX_SIZE (MESSAGE_MAX_SIZE + 256U)
+#ifndef SERVER_PORT
 #define SERVER_PORT 8080
+#endif
 #define USERNAME_SIZE 32
 #define SERVER_IP "127.0.0.1"
 #define TIMEOUT 200
-#define LOGIN_TIMEOUT_SEC 10
+#define LOGIN_TIMEOUT_SEC 30
 #define FILE_CHUNK_SIZE 900
+
+/* crypto_box wire sizes; the server only handles public metadata. */
+#define CHAT_PUBLIC_KEY_SIZE 32
+#define CHAT_NONCE_SIZE 24
+#define CHAT_MAC_SIZE 16
+#define CHAT_OVERHEAD (1 + CHAT_NONCE_SIZE + CHAT_PUBLIC_KEY_SIZE + CHAT_MAC_SIZE)
+#define CHAT_MAX_MESSAGE_SIZE MESSAGE_MAX_SIZE
 
 typedef enum {
     FRAME_FILE_BEGIN,
     FRAME_FILE_CHUNK,
     FRAME_FILE_END,
     FRAME_FILE_ERROR,
-    FRAME_TEXT
+    FRAME_TEXT,
+    FRAME_REQUEST_PK,
+    FRAME_PEER_PK,
+    FRAME_CIPHERTEXT,
+    FRAME_REGISTER_PK
 } FrameType;
+
+int is_valid_frame_type(FrameType type);
 
 ssize_t send_all(Connection *connection, const void *buff, size_t length);
 ssize_t recv_all(Connection *connection, void *buff, size_t length);

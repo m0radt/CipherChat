@@ -8,7 +8,7 @@ versions are rejected.
 ## Build
 
 Linux, a C17 compiler, Make, POSIX threads, and the development libraries for
-GNU Readline and OpenSSL 3 are required. Install the OpenSSL command-line tool
+GNU Readline, OpenSSL 3, and libsodium are required. Install the OpenSSL command-line tool
 for certificate setup as well.
 
 ```sh
@@ -119,6 +119,29 @@ inside the TLS connection. After login, every packet has one binary-safe envelop
 [4-byte network-order frame length][1-byte frame type][frame payload]
 ```
 
+User messages are limited to 64 KiB. Frames allow an additional 256 bytes for
+command, username, and encryption metadata. The client registers a fresh
+`crypto_box` public key after login. `/msg` requests the recipient's key,
+then encrypts the message with a fresh nonce before sending it to the server.
+
+| Type | Value | Payload |
+| --- | --- | --- |
+| `FRAME_REQUEST_PK` | 5 | Recipient username bytes |
+| `FRAME_PEER_PK` | 6 | 1-byte username length, username, 32-byte public key |
+| `FRAME_CIPHERTEXT` | 7 | Client to server: recipient name, nonce, sender public key, ciphertext. Server to recipient: authenticated sender name, nonce, sender public key, ciphertext. |
+| `FRAME_REGISTER_PK` | 8 | 32-byte public key for the current connection |
+
+A name-only `FRAME_PEER_PK` reply indicates an unavailable recipient or key and
+cancels that pending message. Keys are removed on disconnect. The server checks
+the sender's registered key and forwards the ciphertext unchanged. Private
+message text is limited to 64 KiB. Recipients display the
+sender name authenticated by that user's logged-in TLS connection.
+
+Key distribution trusts the server; clients do not independently verify peer
+identities. Broadcasts, files, and legacy text-frame private messages use TLS
+without the additional client-to-client encryption. Restart the server and
+clients together after updating the encrypted-message protocol.
+
 The server tracks each upload by sender connection and transfer ID, assigns a
 globally unique ID for the receiving client, validates sizes and names, and
 serializes complete frames so concurrent senders cannot corrupt one another's
@@ -159,3 +182,8 @@ Additional suites cover certificate and IP rejection, TLS 1.2 rejection,
 concurrent senders, slow recipients, connection cleanup, handshake deadlines
 with silent and trickling peers, and bounded TLS shutdown. TLS failure and
 lifecycle tests generate their own certificates in temporary directories.
+
+Encrypted messaging tests cover key registration and reconnect cleanup,
+recipient lookup, ciphertext forwarding and decryption, tamper rejection,
+malformed replies, pending requests, message limits, and a real two-client
+private-message exchange.
