@@ -49,7 +49,8 @@ static int receive_file_chunk(
 );
 static int receive_file_end(
     const unsigned char *frame,
-    size_t frame_length
+    size_t frame_length,
+    const unsigned char recipient_private_key[crypto_box_SECRETKEYBYTES]
 );
 static int receive_file_error(
     const unsigned char *frame,
@@ -222,6 +223,13 @@ static int receive_file_begin(
         return -1;
     }
 
+    size_t overhead = FILE_CRYPTO_OVERHEAD + strlen(decoded.filename);
+    if (decoded.file_size < overhead ||
+        decoded.file_size - overhead > FILE_PLAINTEXT_MAX_SIZE) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+
     if (ensure_download_directory(download_directory) == -1) {
         return -1;
     }
@@ -282,7 +290,8 @@ static int receive_file_begin(
         return -1;
     }
 
-    incoming_file->file = fdopen(temporary_fd, "wb");
+    /* Stage ciphertext only; authenticate it before writing any plaintext. */
+    incoming_file->file = fdopen(temporary_fd, "w+b");
     if (incoming_file->file == NULL) {
         saved_errno = errno;
         (void)close(temporary_fd);
@@ -292,7 +301,7 @@ static int receive_file_begin(
     }
 
     printf(
-        "Receiving file \"%s\" (%" PRIu64 " bytes) from %s\n",
+        "Receiving encrypted file \"%s\" (%" PRIu64 " encrypted bytes) from %s\n",
         incoming_file->filename,
         incoming_file->expected_size,
         incoming_file->sender
@@ -360,15 +369,90 @@ static int receive_file_chunk(
     return 0;
 }
 
+static int decrypt_received_file(
+    IncomingFile *incoming_file,
+    const unsigned char recipient_private_key[crypto_box_SECRETKEYBYTES],
+    size_t *file_size
+) {
+    /* The size was bounded at FILE_BEGIN and checked against bytes received. */
+    size_t encrypted_length = (size_t)incoming_file->expected_size;
+    unsigned char *encrypted = malloc(encrypted_length);
+    if (encrypted == NULL) {
+        return -1;
+    }
+    int result = -1;
+
+    if (fseek(incoming_file->file, 0, SEEK_SET) != 0) {
+        goto cleanup;
+    }
+    if (fread(encrypted, 1, encrypted_length, incoming_file->file)
+            != encrypted_length) {
+        errno = EIO;
+        goto cleanup;
+    }
+    if (memcmp(encrypted, FILE_CRYPTO_MAGIC, FILE_CRYPTO_MAGIC_SIZE) != 0) {
+        errno = EPROTO;
+        goto cleanup;
+    }
+
+    const unsigned char *sender_key = encrypted + FILE_CRYPTO_MAGIC_SIZE;
+    const unsigned char *nonce = sender_key + crypto_box_PUBLICKEYBYTES;
+    unsigned char *plaintext = encrypted + FILE_CRYPTO_HEADER_SIZE;
+    size_t ciphertext_length = encrypted_length - FILE_CRYPTO_HEADER_SIZE;
+    if (crypto_box_open_easy(plaintext, plaintext, ciphertext_length, nonce,
+                             sender_key, recipient_private_key) != 0) {
+        errno = EBADMSG;
+        goto cleanup;
+    }
+
+    size_t plaintext_length = ciphertext_length - crypto_box_MACBYTES;
+    size_t filename_length = ((size_t)plaintext[FILE_CRYPTO_MAGIC_SIZE] << 8) |
+        plaintext[FILE_CRYPTO_MAGIC_SIZE + 1];
+    if (memcmp(plaintext, FILE_CRYPTO_MAGIC, FILE_CRYPTO_MAGIC_SIZE) != 0 ||
+        filename_length != strlen(incoming_file->filename) ||
+        filename_length > plaintext_length - FILE_CRYPTO_METADATA_SIZE ||
+        memcmp(plaintext + FILE_CRYPTO_METADATA_SIZE,
+               incoming_file->filename, filename_length) != 0) {
+        errno = EBADMSG;
+        goto cleanup;
+    }
+
+    size_t data_offset = FILE_CRYPTO_METADATA_SIZE + filename_length;
+    *file_size = plaintext_length - data_offset;
+    if (fseek(incoming_file->file, 0, SEEK_SET) != 0) {
+        goto cleanup;
+    }
+    if (fwrite(plaintext + data_offset, 1, *file_size, incoming_file->file)
+            != *file_size) {
+        errno = EIO;
+        goto cleanup;
+    }
+    if (fflush(incoming_file->file) == EOF ||
+        ftruncate(fileno(incoming_file->file), (off_t)*file_size) == -1) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup: {
+        int saved_errno = errno;
+        sodium_memzero(encrypted, encrypted_length);
+        free(encrypted);
+        errno = saved_errno;
+    }
+    return result;
+}
+
 static int receive_file_end(
     const unsigned char *frame,
-    size_t frame_length
+    size_t frame_length,
+    const unsigned char recipient_private_key[crypto_box_SECRETKEYBYTES]
 )
 {
     uint32_t transfer_id;
     IncomingFile *incoming_file;
     FILE *completed_file;
     int saved_errno;
+    size_t file_size;
 
     if (file_protocol_decode_control(
             frame,
@@ -395,6 +479,14 @@ static int receive_file_end(
             incoming_file->received_size
         );
         saved_errno = EIO;
+        discard_incoming_file(incoming_file);
+        errno = saved_errno;
+        return -1;
+    }
+
+    if (decrypt_received_file(incoming_file, recipient_private_key,
+                              &file_size) == -1) {
+        saved_errno = errno;
         discard_incoming_file(incoming_file);
         errno = saved_errno;
         return -1;
@@ -437,7 +529,7 @@ static int receive_file_end(
         "Received file from %s: %s (%" PRIu64 " bytes)\n",
         incoming_file->sender,
         incoming_file->final_path,
-        incoming_file->received_size
+        (uint64_t)file_size
     );
     fflush(stdout);
     memset(incoming_file, 0, sizeof(*incoming_file));
@@ -484,10 +576,11 @@ static int receive_file_error(
 int handle_incoming_file_frame(
     const unsigned char *frame,
     size_t frame_length,
-    const char *download_directory
+    const char *download_directory,
+    const unsigned char recipient_private_key[crypto_box_SECRETKEYBYTES]
 )
 {
-    if (frame == NULL || frame_length == 0) {
+    if (frame == NULL || frame_length == 0 || recipient_private_key == NULL) {
         errno = EINVAL;
         return -1;
     }
@@ -502,7 +595,7 @@ int handle_incoming_file_frame(
     case FRAME_FILE_CHUNK:
         return receive_file_chunk(frame, frame_length);
     case FRAME_FILE_END:
-        return receive_file_end(frame, frame_length);
+        return receive_file_end(frame, frame_length, recipient_private_key);
     case FRAME_FILE_ERROR:
         return receive_file_error(frame, frame_length);
     case FRAME_TEXT:

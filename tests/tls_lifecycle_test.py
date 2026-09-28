@@ -3,13 +3,16 @@
 
 from pathlib import Path
 import os
+import pty
 import select
 import shutil
+import signal
 import socket
 import ssl
 import struct
 import subprocess
 import tempfile
+import termios
 import time
 import unittest
 
@@ -91,6 +94,63 @@ class TLSClientTestCase(unittest.TestCase):
 
 
 class TLSLifecycleTests(TLSClientTestCase):
+    def test_client_redraws_partial_input_after_terminal_resize(self):
+        master_fd, slave_fd = pty.openpty()
+        terminal = self.enterContext(os.fdopen(master_fd, "r+b", buffering=0))
+        client_terminal = self.enterContext(os.fdopen(slave_fd, "r+b", buffering=0))
+        termios.tcsetwinsize(client_terminal, (24, 80))
+
+        def read_until(marker):
+            output = b""
+            deadline = time.monotonic() + 3
+            while marker not in output:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([terminal], [], [], remaining)[0]:
+                    self.fail(f"Client did not redraw {marker!r}: {output!r}")
+                chunk = os.read(terminal.fileno(), 4096)
+                self.assertTrue(chunk, "Client closed its terminal")
+                output += chunk
+            return output
+
+        with self.listener() as listener:
+            process = self.enterContext(subprocess.Popen(
+                [str(CLIENT.resolve())], cwd=self.client_directory,
+                stdin=client_terminal, stdout=client_terminal,
+                stderr=subprocess.STDOUT,
+                env={**os.environ, "TERM": "xterm-256color"},
+            ))
+            self.addCleanup(stop_process, process)
+            raw, _ = listener.accept()
+            self.addCleanup(raw.close)
+            raw.settimeout(3)
+            peer = self.server_context.wrap_socket(raw, server_side=True)
+            self.addCleanup(peer.close)
+            read_until(b"Username: ")
+            terminal.write(b"resize\n")
+            self.assertEqual(receive_legacy_message(peer), b"resize")
+            send_legacy_message(peer, b"Welcome to CipherChat, resize!\n")
+            self.assertEqual(receive_frame(peer)[0], FRAME_REGISTER_PK)
+            read_until(b"> ")
+
+            command = b"/broadcast " + b"x" * 20
+            terminal.write(command)
+            read_until(command)
+            for dimensions in ((17, 125), (24, 80), (17, 125)):
+                with self.subTest(dimensions=dimensions):
+                    termios.tcsetwinsize(client_terminal, dimensions)
+                    # Popen's PTY is not the child's controlling terminal, so
+                    # send the notification a real terminal would deliver.
+                    process.send_signal(signal.SIGWINCH)
+                    read_until(b"> " + command)
+
+            terminal.write(b"y" * 100 + b"\n")
+            self.assertEqual(receive_frame(peer), (FRAME_TEXT, command + b"y" * 100))
+            terminal.write(b"/quit\n")
+            self.assertEqual(receive_frame(peer), (FRAME_TEXT, b"/quit"))
+            with peer.unwrap() as transport:
+                self.assertEqual(transport.recv(1), b"")
+            self.assertEqual(process.wait(timeout=3), 0)
+
     def test_client_parses_only_private_messages(self):
         # Readline can echo more than a pipe can hold before we read the output.
         output_file = self.enterContext(tempfile.TemporaryFile(mode="w+t"))

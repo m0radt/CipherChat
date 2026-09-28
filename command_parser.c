@@ -29,7 +29,8 @@ ParsedCommand parse_command(char *command)
     ParsedCommand result = {
         .type = CMD_UNKNOWN,
         .username = NULL,
-        .message = NULL
+        .message = NULL,
+        .filepath = NULL
     };
 
     if (command == NULL) {
@@ -118,6 +119,44 @@ ParsedCommand parse_command(char *command)
         result.type = CMD_PRIVATE_MESSAGE;
         result.username = username;
         result.message = message;
+        return result;
+    }
+    if (strcmp(verb, "/file") == 0) {
+        if (*arguments == '\0') {
+            result.type = CMD_INVALID;
+            return result;
+        }
+
+        char *username = arguments;
+
+        while (*arguments != '\0' &&
+               !isspace((unsigned char)*arguments)) {
+            arguments++;
+        }
+
+        if (*arguments == '\0') {
+            result.type = CMD_INVALID;
+            return result;
+        }
+
+        *arguments = '\0';
+        char *filepath = skip_whitespace(arguments + 1);
+
+        size_t filepath_length = strlen(filepath);
+        while (filepath_length > 0 &&
+               isspace((unsigned char)filepath[filepath_length - 1])) {
+            filepath[--filepath_length] = '\0';
+        }
+
+        if (*filepath == '\0' ||
+            strlen(username) >= USERNAME_SIZE) {
+            result.type = CMD_INVALID;
+            return result;
+        }
+
+        result.type = CMD_FILE_TRANSFER; /*the type does not matter */
+        result.username = username;
+        result.filepath = filepath;
         return result;
     }
 

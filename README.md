@@ -4,6 +4,8 @@ A small C17 chat server and terminal client using **TLS 1.3 over TCP**. It suppo
 private messages, broadcasts, connected-user listings, and private binary file
 transfers. Clients verify the server's certificate and IP address; older TLS
 versions are rejected.
+Private messages and file contents also use end-to-end authenticated encryption
+with libsodium.
 
 ## Build
 
@@ -109,6 +111,13 @@ files are never overwritten. Incomplete transfers use temporary files that are
 removed if the transfer or connection fails. Empty files and binary data are
 supported. File transfers to your own username are rejected.
 
+Original files are limited to **16 MiB** because the client encrypts each whole
+file in memory using libsodium's `crypto_box_easy` and a fresh random nonce.
+The receiver stages encrypted bytes in a temporary file, then authenticates and
+decrypts the complete transfer before saving the final download. The filename
+is included in the authenticated contents, but filenames, routing information,
+and encrypted transfer sizes remain visible to the server.
+
 ## Protocol
 
 After the TLS 1.3 handshake, login uses a length-prefixed username followed by a
@@ -121,8 +130,9 @@ inside the TLS connection. After login, every packet has one binary-safe envelop
 
 User messages are limited to 64 KiB. Frames allow an additional 256 bytes for
 command, username, and encryption metadata. The client registers a fresh
-`crypto_box` public key after login. `/msg` requests the recipient's key,
-then encrypts the message with a fresh nonce before sending it to the server.
+`crypto_box` public key after login. `/msg` and `/file` request the recipient's
+key, then encrypt the message or file with a fresh nonce before sending it to
+the server.
 
 | Type | Value | Payload |
 | --- | --- | --- |
@@ -132,15 +142,28 @@ then encrypts the message with a fresh nonce before sending it to the server.
 | `FRAME_REGISTER_PK` | 8 | 32-byte public key for the current connection |
 
 A name-only `FRAME_PEER_PK` reply indicates an unavailable recipient or key and
-cancels that pending message. Keys are removed on disconnect. The server checks
+cancels that pending message or file transfer. Keys are removed on disconnect.
+For private message frames, the server checks
 the sender's registered key and forwards the ciphertext unchanged. Private
 message text is limited to 64 KiB. Recipients display the
 sender name authenticated by that user's logged-in TLS connection.
 
 Key distribution trusts the server; clients do not independently verify peer
-identities. Broadcasts, files, and legacy text-frame private messages use TLS
+identities. Broadcasts and legacy text-frame private messages use TLS
 without the additional client-to-client encryption. Restart the server and
 clients together after updating the encrypted-message protocol.
+
+File encryption uses the existing file frames to carry an opaque byte stream:
+
+```text
+[CCFILE01][sender public key][nonce][MAC + encrypted contents]
+```
+
+The encrypted contents contain a format marker, a two-byte big-endian filename
+length, the filename, and the original file bytes. The receiver verifies the
+authentication tag and checks that the authenticated filename matches the
+announced filename. Both sending and receiving clients must support this format;
+updated clients reject older plaintext file transfers.
 
 The server tracks each upload by sender connection and transfer ID, assigns a
 globally unique ID for the receiving client, validates sizes and names, and
@@ -157,8 +180,9 @@ stream.
   with Linux `eventfd` notifications.
 - `file_protocol.c` is the single encoder, decoder, and validator for file
   frame payloads shared by the client and server.
-- `client_file_sender.c` reads local files and produces file frames.
-- `client_file_receiver.c` owns incoming-transfer and filesystem state.
+- `client_file_sender.c` reads and encrypts local files, then produces file frames.
+- `client_file_receiver.c` authenticates and decrypts received files and owns
+  incoming-transfer and filesystem state.
 - `server_files.c` handles file-frame routing decisions and notifications.
 - `server_file_routes.c` owns the synchronized server transfer table and ID
   remapping.

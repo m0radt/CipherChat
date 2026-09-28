@@ -24,16 +24,22 @@ static bool connected = true;
 static Connection *active_connection = NULL;
 static int client_exit_code = 0;
 
-typedef struct PendingMessage {
-    char recipient[USERNAME_SIZE];
-    char *message;  // Owned copy of the message text
-    struct PendingMessage *next;
-} PendingMessage;
+typedef enum {
+    PENDING_MESSAGE,
+    PENDING_FILE
+} PendingPackageType;
 
-static PendingMessage *pending_head = NULL;
-static PendingMessage *pending_tail = NULL;
+typedef struct PendingPackage {
+    PendingPackageType type;
+    char recipient[USERNAME_SIZE];
+    char *data;  // Owned copy of the message text or file path.
+    struct PendingPackage *next;
+} PendingPackage;
+
+static PendingPackage *pending_head = NULL;
+static PendingPackage *pending_tail = NULL;
 static size_t pending_count = 0;
-#define MAX_PENDING_MESSAGES 128
+#define MAX_PENDING_PACKAGES 128
 
 _Static_assert(CHAT_PUBLIC_KEY_SIZE == crypto_box_PUBLICKEYBYTES,
                "public key wire size mismatch");
@@ -96,6 +102,8 @@ int main(void) {
     active_connection = &connection;
 
     rl_variable_bind("horizontal-scroll-mode", "off");
+    /* Catch terminal resizes while the event loop is waiting for input. */
+    rl_persistent_signal_handlers = 1;
     rl_callback_handler_install("> ", handle_input);
 
     while (connected) {
@@ -113,6 +121,7 @@ int main(void) {
 
         int result;
         do {
+            rl_check_signals();
             result = poll(fds, 2, tls_data_ready ? 0 /*Check events without waiting.*/: -1 /*Wait for an event.*/);
 
         } while (result == -1 && errno == EINTR);
@@ -122,6 +131,8 @@ int main(void) {
             client_exit_code = 1;
             break;
         }
+
+        rl_check_signals();
 
         if (tls_data_ready || (fds[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
             unsigned char frame[FRAME_MAX_SIZE];
@@ -156,9 +167,9 @@ int main(void) {
     cleanup_incoming_files();
 
     while (pending_head != NULL) {
-        PendingMessage *pending = pending_head;
+        PendingPackage *pending = pending_head;
         pending_head = pending->next;
-        free(pending->message);
+        free(pending->data);
         free(pending);
     }
     pending_tail = NULL;
@@ -316,8 +327,8 @@ static void handle_server_frame(
         memcpy(recipient, frame + 2, name_length);
         recipient[name_length] = '\0';
 
-        PendingMessage *previous = NULL;
-        PendingMessage *pending = pending_head;
+        PendingPackage *previous = NULL;
+        PendingPackage *pending = pending_head;
         while (pending != NULL && strcmp(pending->recipient, recipient) != 0) {
             previous = pending;
             pending = pending->next;
@@ -335,24 +346,36 @@ static void handle_server_frame(
         }
         pending_count--;
 
+        const char *operation = pending->type == PENDING_FILE
+            ? "File send" : "Private message";
         if (frame_length == key_offset) {
-            fprintf(stderr, "Private message failed: public key unavailable for %s.\n",
-                    recipient);
+            fprintf(stderr, "%s failed: public key unavailable for %s.\n",
+                    operation, recipient);
         } else {
-            unsigned char nonce[crypto_box_NONCEBYTES];
-            randombytes_buf(nonce, sizeof(nonce));
-            if (send_private_chat(recipient, (const unsigned char *)pending->message,
-                                  strlen(pending->message), nonce,
-                                  frame + key_offset) == -1) {
+            int result;
+            if (pending->type == PENDING_FILE) {
+                result = send_file(
+                    active_connection, recipient, pending->data,
+                    frame + key_offset, public_key, private_key
+                ) == -1 ? -1 : 0;
+            } else {
+                unsigned char nonce[crypto_box_NONCEBYTES];
+                randombytes_buf(nonce, sizeof(nonce));
+                result = send_private_chat(
+                    recipient, (const unsigned char *)pending->data,
+                    strlen(pending->data), nonce, frame + key_offset
+                );
+            }
+            if (result == -1) {
                 int saved_errno = errno;
-                fprintf(stderr, "Private message failed: %s\n", strerror(saved_errno));
+                fprintf(stderr, "%s failed: %s\n", operation, strerror(saved_errno));
                 if (is_connection_error(saved_errno)) {
                     client_exit_code = 1;
                     connected = false;
                 }
             }
         }
-        free(pending->message);
+        free(pending->data);
         free(pending);
         return;
     }
@@ -368,7 +391,8 @@ static void handle_server_frame(
     if (handle_incoming_file_frame(
             frame,
             frame_length,
-            DOWNLOAD_DIRECTORY
+            DOWNLOAD_DIRECTORY,
+            private_key
         ) == -1) {
         int saved_errno = errno;
         fprintf(stderr, "File receive failed: %s\n", strerror(saved_errno));
@@ -454,51 +478,6 @@ static void handle_input(char *line) {
 }
 
 
-static int handle_private_message(Connection *connection, char *line) {
-    ParsedCommand parsed = parse_command(line);
-    if (parsed.type != CMD_PRIVATE_MESSAGE) {
-        fprintf(stderr, "Usage: /msg <username> <message>\n");
-        errno = EINVAL;
-        return -1;
-    }
-    size_t recipient_length = strlen(parsed.username);
-    if (strlen(parsed.message) > CHAT_MAX_MESSAGE_SIZE) {
-        errno = EMSGSIZE;
-        return -1;
-    }
-    if (pending_count >= MAX_PENDING_MESSAGES) {
-        errno = ENOBUFS;
-        return -1;
-    }
-    PendingMessage *pending = malloc(sizeof(*pending));
-    if (pending == NULL) {
-        return -1;
-    }
-    pending->message = strdup(parsed.message);
-    if (pending->message == NULL) {
-        free(pending);
-        return -1;
-    }
-    memcpy(pending->recipient, parsed.username, recipient_length + 1);
-    pending->next = NULL;
-
-    if (send_frame(connection, FRAME_REQUEST_PK, parsed.username, recipient_length) == -1) {
-        int saved_errno = errno;
-        free(pending->message);
-        free(pending);
-        errno = saved_errno;
-        return -1;
-    }
-    /* The event loop cannot process a reply until this callback returns. */
-    if (pending_tail != NULL) {
-        pending_tail->next = pending;
-    } else {
-        pending_head = pending;
-    }
-    pending_tail = pending;
-    pending_count++;
-    return 0;
-}
 
 static bool is_connection_error(int error_number) {
     return error_number == EPIPE ||
@@ -578,40 +557,96 @@ static int receive_welcome_message(Connection *connection) {
     return 0;
 }
 
+static int handle_private_message(Connection *connection, char *line) {
+    ParsedCommand parsed = parse_command(line);
+    if (parsed.type != CMD_PRIVATE_MESSAGE) {
+        fprintf(stderr, "Usage: /msg <username> <message>\n");
+        errno = EINVAL;
+        return -1;
+    }
+    size_t recipient_length = strlen(parsed.username);
+    if (strlen(parsed.message) > CHAT_MAX_MESSAGE_SIZE) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+    if (pending_count >= MAX_PENDING_PACKAGES) {
+        errno = ENOBUFS;
+        return -1;
+    }
+    PendingPackage *pending = malloc(sizeof(*pending));
+    if (pending == NULL) {
+        return -1;
+    }
+    pending->type = PENDING_MESSAGE;
+    pending->data = strdup(parsed.message);
+    if (pending->data == NULL) {
+        free(pending);
+        return -1;
+    }
+    memcpy(pending->recipient, parsed.username, recipient_length + 1);
+    pending->next = NULL;
+
+    if (send_frame(connection, FRAME_REQUEST_PK, parsed.username, recipient_length) == -1) {
+        int saved_errno = errno;
+        free(pending->data);
+        free(pending);
+        errno = saved_errno;
+        return -1;
+    }
+    /* The event loop cannot process a reply until this callback returns. */
+    if (pending_tail != NULL) {
+        pending_tail->next = pending;
+    } else {
+        pending_head = pending;
+    }
+    pending_tail = pending;
+    pending_count++;
+    return 0;
+}
+
 static int handle_file_command(Connection *connection, char *line) {
-    char *cursor = line + 5;
-
-    while (isspace((unsigned char)*cursor)) {
-        cursor++;
-    }
-
-    if (*cursor == '\0') {
-        fprintf(stderr, "Usage: /file <username> <path>\n");
+    ParsedCommand parsed = parse_command(line);
+    if (parsed.type != CMD_FILE_TRANSFER) {
+        fprintf(stderr, "Usage: /file <username> <file_path>\n");
         errno = EINVAL;
         return -1;
     }
-
-    char *recipient = cursor;
-    while (*cursor != '\0' && !isspace((unsigned char)*cursor)) {
-        cursor++;
-    }
-
-    if (*cursor == '\0') {
-        fprintf(stderr, "Missing file path\n");
-        errno = EINVAL;
+    size_t recipient_length = strlen(parsed.username);
+    if (strlen(parsed.filepath) > PATH_MAX) {
+        errno = EMSGSIZE;
         return -1;
     }
-
-    *cursor++ = '\0';
-    while (isspace((unsigned char)*cursor)) {
-        cursor++;
-    }
-
-    if (*cursor == '\0') {
-        fprintf(stderr, "Missing file path\n");
-        errno = EINVAL;
+    if (pending_count >= MAX_PENDING_PACKAGES) {
+        errno = ENOBUFS;
         return -1;
     }
+    PendingPackage *pending = malloc(sizeof(*pending));
+    if (pending == NULL) {
+        return -1;
+    }
+    pending->type = PENDING_FILE;
+    pending->data = strdup(parsed.filepath);
+    if (pending->data == NULL) {
+        free(pending);
+        return -1;
+    }
+    memcpy(pending->recipient, parsed.username, recipient_length + 1);
+    pending->next = NULL;
 
-    return send_file(connection, recipient, cursor) == -1 ? -1 : 0;
+    if (send_frame(connection, FRAME_REQUEST_PK, parsed.username, recipient_length) == -1) {
+        int saved_errno = errno;
+        free(pending->data);
+        free(pending);
+        errno = saved_errno;
+        return -1;
+    }
+    /* The event loop cannot process a reply until this callback returns. */
+    if (pending_tail != NULL) {
+        pending_tail->next = pending;
+    } else {
+        pending_head = pending;
+    }
+    pending_tail = pending;
+    pending_count++;
+    return 0;
 }
